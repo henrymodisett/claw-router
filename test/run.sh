@@ -1131,6 +1131,74 @@ else
   if grep -q 'home' "$SBX/watch_e2e_err"; then ok "e2e: stderr mentions home account"; else bad "e2e: home in stderr" "$(cat "$SBX/watch_e2e_err")"; fi
 fi
 
+echo "== watch: supervised terminal input =="
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$CR_REPO" "$SBX" <<'PY'
+import errno
+import json
+import os
+from pathlib import Path
+import pty
+import select
+import signal
+import sys
+import time
+
+repo, sandbox = map(Path, sys.argv[1:])
+home = sandbox / "watch_tty_home"
+home.mkdir()
+(home / "config.json").write_text(json.dumps({
+    "watchIntervalSeconds": 60,
+    "accounts": [{"name": name, "kind": "subscription", "usagePct": 10,
+                  "configDir": str(home / name)} for name in ("work", "home")],
+}))
+bin_dir = sandbox / "watch_tty_bin"
+bin_dir.mkdir()
+claude = bin_dir / "claude"
+claude.write_text('''#!/usr/bin/env python3
+import os, sys
+if os.fstat(0).st_rdev != int(os.environ["WATCH_EXPECTED_STDIN_DEVICE"]):
+    sys.exit("watch replaced the original terminal device")
+if sys.stdin.readline() != "watch-stdin\\n":
+    sys.exit("watch lost terminal input")
+print("inherited-terminal-input-ok", flush=True)
+''')
+claude.chmod(0o755)
+pid, terminal = pty.fork()
+if pid == 0:
+    env = dict(os.environ, CR_HOME=str(home), CR_NO_USAGE_POLL="1",
+               WATCH_EXPECTED_STDIN_DEVICE=str(os.fstat(0).st_rdev))
+    env["PATH"] = str(bin_dir) + os.pathsep + env["PATH"]
+    os.execve(str(repo / "cr"), [str(repo / "cr"), "@work", "--watch"], env)
+
+os.write(terminal, b"watch-stdin\n")
+output = bytearray()
+deadline = time.monotonic() + 10
+try:
+    while time.monotonic() < deadline:
+        if select.select([terminal], [], [], 0.1)[0]:
+            try:
+                output.extend(os.read(terminal, 8192))
+            except OSError as error:
+                if error.errno != errno.EIO:
+                    raise
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, output.decode()
+            assert b"inherited-terminal-input-ok" in output, output.decode()
+            break
+    else:
+        os.killpg(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+        raise AssertionError("watch terminal input timed out: " + output.decode())
+finally:
+    os.close(terminal)
+PY
+  eq "watch: child inherits terminal device and reads input" "$?" "0"
+else
+  printf '  skip watch terminal input (python3 unavailable)\n'
+fi
+
 # Restore the standard fake claude (identical to the original at the top).
 cat > "$FAKEBIN/claude" <<'EOF'
 #!/usr/bin/env bash

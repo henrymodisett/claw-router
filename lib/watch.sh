@@ -271,7 +271,8 @@ cr_watch_run() {
     # Launch claude in background so we can supervise it.
     cr_build_exec
     if [[ -t 0 ]]; then
-      "${CR_EXEC[@]}" ${args[@]+"${args[@]}"} </dev/tty &
+      # Keep the original terminal device; Bun cannot kqueue macOS /dev/tty.
+      "${CR_EXEC[@]}" ${args[@]+"${args[@]}"} <&0 &
     else
       "${CR_EXEC[@]}" ${args[@]+"${args[@]}"} &
     fi
